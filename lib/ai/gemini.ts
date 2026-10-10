@@ -1,11 +1,46 @@
 const GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'] as const;
 
-const GEMINI_KEYS = [
-  { keyName: 'GEMINI_API_KEY_PRIMARY', model: GEMINI_MODELS[0] },
-  { keyName: 'GEMINI_API_KEY_PRIMARY', model: GEMINI_MODELS[1] },
-  { keyName: 'GEMINI_API_KEY_SECONDARY', model: GEMINI_MODELS[0] },
-  { keyName: 'GEMINI_API_KEY_SECONDARY', model: GEMINI_MODELS[1] },
-] as const;
+const GEMINI_KEY_NAMES = ['GEMINI_API_KEY_PRIMARY', 'GEMINI_API_KEY_SECONDARY'] as const;
+
+function resolveModels(): readonly string[] {
+  const pinned = process.env.MODEL_NAME?.trim();
+  if (pinned) {
+    return [pinned, ...GEMINI_MODELS.filter((model) => model !== pinned)];
+  }
+  return [...GEMINI_MODELS];
+}
+
+function resolveAttempts(): Array<{ keyName: string; model: string }> {
+  const attempts: Array<{ keyName: string; model: string }> = [];
+  for (const keyName of GEMINI_KEY_NAMES) {
+    for (const model of resolveModels()) {
+      attempts.push({ keyName, model });
+    }
+  }
+  return attempts;
+}
+
+export type GeminiPart =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } };
+
+export interface GeminiOptions {
+  temperature?: number;
+  maxOutputTokens?: number;
+  responseMimeType?: string;
+  responseSchema?: Record<string, unknown>;
+  systemInstruction?: string;
+}
+
+interface GeminiCandidate {
+  content?: {
+    parts?: Array<{ text?: string }>;
+  };
+}
+
+interface GeminiApiResponse {
+  candidates?: GeminiCandidate[];
+}
 
 function isRetryableGeminiError(errorMessage: string): boolean {
   const lower = errorMessage.toLowerCase();
@@ -21,10 +56,37 @@ function isRetryableGeminiError(errorMessage: string): boolean {
   );
 }
 
-export async function generateTextWithGemini(prompt: string): Promise<string> {
-  const errors: string[] = [];
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  for (const attempt of GEMINI_KEYS) {
+export async function generateContentWithGemini(
+  parts: GeminiPart[],
+  options: GeminiOptions = {},
+): Promise<string> {
+  const errors: string[] = [];
+  const attempts = resolveAttempts();
+
+  const generationConfig: Record<string, unknown> = {
+    temperature: options.temperature ?? 0,
+    maxOutputTokens: options.maxOutputTokens ?? 1024,
+  };
+  if (options.responseMimeType) {
+    generationConfig.responseMimeType = options.responseMimeType;
+  }
+  if (options.responseSchema) {
+    generationConfig.responseSchema = options.responseSchema;
+  }
+
+  const body: Record<string, unknown> = {
+    contents: [{ role: 'user', parts }],
+    generationConfig,
+  };
+  if (options.systemInstruction) {
+    body.systemInstruction = { parts: [{ text: options.systemInstruction }] };
+  }
+
+  for (const attempt of attempts) {
     const apiKey = process.env[attempt.keyName];
 
     if (!apiKey) {
@@ -40,21 +102,7 @@ export async function generateTextWithGemini(prompt: string): Promise<string> {
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: prompt,
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 500,
-            },
-          }),
+          body: JSON.stringify(body),
         },
       );
 
@@ -65,24 +113,25 @@ export async function generateTextWithGemini(prompt: string): Promise<string> {
         if (!isRetryableGeminiError(errorText) && response.status !== 429) {
           throw new Error(errorMsg);
         }
+        if (response.status === 429) {
+          await sleep(30_000);
+        }
         continue;
       }
 
-      const data = (await response.json()) as {
-        candidates: Array<{
-          content: {
-            parts: Array<{ text: string }>;
-          };
-        }>;
-      };
+      const data = (await response.json()) as GeminiApiResponse;
+      const text = data.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text ?? '')
+        .join('')
+        .trim();
 
-      if (!data.candidates || data.candidates.length === 0 || !data.candidates[0]?.content?.parts?.[0]?.text) {
+      if (!text) {
         const errorMsg = `Invalid response from Gemini ${attempt.model} (${attempt.keyName})`;
         errors.push(errorMsg);
         continue;
       }
 
-      return data.candidates[0].content.parts[0].text.trim();
+      return text;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       errors.push(errorMsg);
@@ -91,4 +140,11 @@ export async function generateTextWithGemini(prompt: string): Promise<string> {
   }
 
   throw new Error(`All Gemini attempts failed: ${errors.join(', ')}`);
+}
+
+export async function generateTextWithGemini(prompt: string): Promise<string> {
+  return generateContentWithGemini([{ text: prompt }], {
+    temperature: 0.7,
+    maxOutputTokens: 500,
+  });
 }
